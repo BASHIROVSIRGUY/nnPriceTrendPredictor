@@ -1,0 +1,35 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="aiofiles" />
+          <option value="aiogram" />
+          <option value="aiohttp" />
+          <option value="aiosignal" />
+          <option value="fastapi" />
+          <option value="frozenlist" />
+          <option value="setuptools" />
+          <option value="wheel" />
+          <option value="yarl" />
+          <option value="uvicorn" />
+          <option value="pydantic" />
+          <option value="python-dotenv" />
+          <option value="pytest" />
+          <option value="pytest-asyncio" />
+          <option value="black" />
+          <option value="flake8" />
+          <option value="confluent-kafka" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="telegram_bot.*" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
