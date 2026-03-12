@@ -1,205 +1,130 @@
+from __future__ import annotations
 
-import merlin.io
-from merlin.dataloader.torch import Loader
+from dataclasses import dataclass
+from typing import List, Optional
 
-# Просто создаем Dataset из Parquet файлов
-dataset = merlin.io.Dataset('/path/to/your/files.parquet', engine="parquet")
-
-# И используем его в даталоадере PyTorch
-loader = Loader(dataset, batch_size=1024)
-for batch in loader:
-    # batch уже на GPU (если доступен)
-    pass
-
-
-
-import polars as pl
-from torch.utils.data import IterableDataset, DataLoader
-
-class ParquetStreamingDataset(IterableDataset):
-    def __init__(self, parquet_path, batch_size=64):
-        super().__init__()
-        self.path = parquet_path
-        self.batch_size = batch_size
-        # Ленивое сканирование: файл не читается, только смотрятся метаданные
-        self.scan = pl.scan_parquet(self.path)
-
-    def __iter__(self):
-        # Здесь вы определяете логику того, как читать данные.
-        # Например, можно читать по группам строк (row groups)
-        # или по заранее вычисленным индексам батчей.
-        for batch_df in self._stream_batches():
-            # Конвертация DataFrame из Polars в тензоры PyTorch
-            images = torch.tensor(batch_df['image'].to_numpy())
-            labels = torch.tensor(batch_df['label'].to_numpy())
-            yield images, labels
-
-    def _stream_batches(self):
-        # Собираем батч из нужного количества строк
-        return self.scan.collect().iter_slices(n_rows=self.batch_size)
-
-# Использование со стандартным DataLoader
-dataset = ParquetStreamingDataset('/path/to/data.parquet', batch_size=64)
-dataloader = DataLoader(dataset, batch_size=None, num_workers=4)
-
-
-
-import os
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, IterableDataset
-from petastorm import make_reader
-from petastorm.pytorch import DataLoader as PetastormDataLoader  # для сравнения, но мы будем делать свой Dataset
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+import torch
+from torch.utils.data import Dataset
 
 
-
-# ============================
-# 1. Подготовка данных: создаём синтетический датасет в формате Parquet
-# ============================
-def create_sample_parquet(num_samples=10000, output_path='./sample_data'):
-    os.makedirs(output_path, exist_ok=True)
-    parquet_path = os.path.join(output_path, 'part.parquet')
-
-    # Генерируем случайные данные: изображения 3x32x32 (плоский вектор) и метки классов
-    data = []
-    for i in range(num_samples):
-        image = np.random.randn(3072).astype(np.float32)  # 3*32*32
-        label = np.random.randint(0, 10, dtype=np.int64)
-        data.append({'image': image, 'label': label})
-
-    df = pd.DataFrame(data)
-    df.to_parquet(parquet_path, engine='pyarrow', compression='snappy')
-    print(f"Датасет сохранён в {parquet_path}, {num_samples} образцов")
-    return parquet_path
+@dataclass
+class WindowConfig:
+    input_window: int = 300
+    label_window: int = 200
+    target_column: str = "close"
+    class_boundaries: Optional[List[float]] = None
+    exclude_columns: Optional[List[str]] = None
+    normalize: bool = True
 
 
-parquet_path = create_sample_parquet(10000)
-
-
-# ============================
-# 2. Определяем собственный IterableDataset, оборачивающий petastorm.Reader
-# ============================
-class PetastormIterableDataset(IterableDataset):
+class ParquetWindowDataset(Dataset):
     """
-    Обёртка над petastorm.Reader для использования в torch.utils.data.DataLoader.
-    Позволяет читать данные из Parquet потоково, без загрузки в память целиком.
+    Dataset that loads sliding windows from a parquet file.
+
+    Each sample:
+        - input: [input_window, num_features]
+        - label: class label derived from the next label_window rows
     """
 
-    def __init__(self, parquet_path, shuffle_rows=True, shuffle_row_groups=True):
+    def __init__(
+        self,
+        parquet_path: str,
+        config: WindowConfig,
+        feature_columns: Optional[List[str]] = None,
+    ) -> None:
         super().__init__()
         self.parquet_path = parquet_path
-        self.shuffle_rows = shuffle_rows
-        self.shuffle_row_groups = shuffle_row_groups
+        self.config = config
+        self._dataset = ds.dataset(parquet_path, format="parquet")
+        self._row_count = pq.ParquetFile(parquet_path).metadata.num_rows
+        self._total_window = config.input_window + config.label_window
 
-    def __iter__(self):
-        # Создаём reader внутри __iter__, чтобы каждый воркер имел своё соединение
-        reader = make_reader(
-            self.parquet_path,
-            shuffle_rows=self.shuffle_rows,
-            shuffle_row_groups=self.shuffle_row_groups,
-            num_epochs=1  # одна эпоха за проход
-        )
-        for row in reader:
-            # Преобразуем строку в тензоры (можно делать прямо здесь)
-            image = torch.tensor(row.image).reshape(3, 32, 32)  # (C, H, W)
-            label = torch.tensor(row.label, dtype=torch.long)
-            yield image, label
-        reader.stop()  # важно закрыть reader после использования
+        if self._row_count < self._total_window:
+            raise ValueError(
+                f"Недостаточно строк ({self._row_count}) для окна {self._total_window}."
+            )
 
-    def __len__(self):
-        # Petastorm умеет быстро получать общее количество строк через метаданные Parquet
-        # Можно использовать pyarrow.parquet для получения числа строк
-        metadata = pq.read_metadata(self.parquet_path)
-        return metadata.num_rows
+        self.feature_columns = feature_columns or self._infer_feature_columns()
+        self._validate_columns()
 
+    def _infer_feature_columns(self) -> List[str]:
+        schema = self._dataset.schema
+        numeric_types = {
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "float",
+            "double",
+        }
+        exclude = set(self.config.exclude_columns or ["open_time"])
+        numeric_columns = [
+            field.name
+            for field in schema
+            if field.type.to_string() in numeric_types
+        ]
+        return [col for col in numeric_columns if col not in exclude]
 
-# ============================
-# 3. Простая свёрточная сеть
-# ============================
-class SimpleCNN(nn.Module):
-    def __init__(self, num_classes=10):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(64 * 8 * 8, 256)
-        self.fc2 = nn.Linear(256, num_classes)
-        self.relu = nn.ReLU()
+    def _validate_columns(self) -> None:
+        available_columns = set(self._dataset.schema.names)
+        missing = [col for col in self.feature_columns if col not in available_columns]
+        if missing:
+            raise ValueError(f"Отсутствуют колонки в parquet: {missing}")
 
-    def forward(self, x):
-        x = self.pool(self.relu(self.conv1(x)))
-        x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(-1, 64 * 8 * 8)
-        x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        if self.config.target_column not in available_columns:
+            raise ValueError(
+                f"Целевая колонка '{self.config.target_column}' отсутствует в parquet."
+            )
 
+    def __len__(self) -> int:
+        return self._row_count - self._total_window + 1
 
-# ============================
-# 4. Цикл обучения с использованием нашего Dataset и стандартного DataLoader
-# ============================
-def train_with_custom_dataset(parquet_path, num_epochs=3, batch_size=64, learning_rate=0.001):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = SimpleCNN(num_classes=10).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.CrossEntropyLoss()
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError("Index out of range")
 
-    # Создаём Dataset
-    train_dataset = PetastormIterableDataset(
-        parquet_path,
-        shuffle_rows=True,
-        shuffle_row_groups=True
-    )
+        start = idx
+        end = idx + self._total_window
+        table = self._dataset.take(list(range(start, end)))
+        window_df = table.to_pandas()
 
-    # Оборачиваем в стандартный DataLoader PyTorch
-    # Важно: num_workers > 0 требует осторожности, но Petastorm поддерживает многопроцессность
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        num_workers=2,  # можно использовать несколько воркеров
-        pin_memory=True if device.type == 'cuda' else False
-    )
+        input_df = window_df.iloc[: self.config.input_window]
+        future_df = window_df.iloc[self.config.input_window :]
 
-    for epoch in range(num_epochs):
-        model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        features = input_df[self.feature_columns].to_numpy(dtype=np.float32)
+        if self.config.normalize:
+            mean = features.mean(axis=0, keepdims=True)
+            std = features.std(axis=0, keepdims=True)
+            std = np.where(std == 0, 1.0, std)
+            features = (features - mean) / std
 
-        # Итерация по батчам
-        for batch_idx, (images, labels) in enumerate(train_loader):
-            images, labels = images.to(device), labels.to(device)
+        label = self._classify_future_window(input_df, future_df)
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+        return torch.tensor(features), torch.tensor(label, dtype=torch.long)
 
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+    def _classify_future_window(self, input_df: pd.DataFrame, future_df: pd.DataFrame) -> int:
+        last_close = input_df[self.config.target_column].iloc[-1]
+        future_mean = future_df[self.config.target_column].mean()
+        if last_close == 0:
+            return 0
 
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch + 1}/{num_epochs}, Batch {batch_idx}, "
-                      f"Loss: {loss.item():.4f}, Acc: {100. * correct / total:.2f}%")
+        pct_change = (future_mean - last_close) / last_close
+        boundaries = self.config.class_boundaries or [-0.002, 0.002]
+        boundaries = sorted(boundaries)
+        return int(np.digitize(pct_change, boundaries))
 
-        epoch_loss = total_loss / len(train_loader)
-        epoch_acc = 100. * correct / total
-        print(f"Epoch {epoch + 1} finished. Avg Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.2f}%")
+    @property
+    def num_features(self) -> int:
+        return len(self.feature_columns)
 
-    print("Обучение завершено")
-    return model
-
-
-# ============================
-# 5. Запуск
-# ============================
-if __name__ == '__main__':
-    trained_model = train_with_custom_dataset(parquet_path, num_epochs=3)
-    torch.save(trained_model.state_dict(), 'model_petastorm.pth')
+    @property
+    def num_classes(self) -> int:
+        return len(self.config.class_boundaries or [-0.002, 0.002]) + 1

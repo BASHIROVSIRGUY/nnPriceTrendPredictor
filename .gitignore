@@ -1,5 +1,5 @@
 Data/
-
+.idea/
 
 _deploy.command
 _docker_build.command
